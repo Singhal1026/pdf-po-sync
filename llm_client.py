@@ -7,92 +7,6 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 logger = logging.getLogger(__name__)
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-GEMINI_URL_PRO = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
-
-# Define which exceptions should trigger a retry
-def is_retryable_error(exception):
-    if isinstance(exception, requests.exceptions.HTTPError):
-        if exception.response is not None:
-            return exception.response.status_code == 429 or exception.response.status_code >= 500
-        return False
-
-    if isinstance(exception, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
-        return True
-
-    return False
-
-@retry(
-    # Stop after 5 attempts
-    stop=stop_after_attempt(5),
-    # Wait exponentially: 5s, 10s, 20s, 40s, 80s (capped at 120s)
-    wait=wait_exponential(multiplier=2, min=5, max=120),
-    # Only retry if it's a rate limit or server error
-    retry=retry_if_exception(is_retryable_error),
-    # Log before sleeping
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-    reraise=True
-)
-def call_llm(prompt: str, full_text: str, api_key: str) -> list[dict]:
-    """
-    Sends prompt + extracted PDF text to Gemini with exponential backoff retry.
-    """
-    full_prompt = f"{prompt}\n{full_text}"
-
-    # print(full_prompt)
-
-    payload = {
-        "contents": [{"parts": [{"text": full_prompt}]}],
-        "generationConfig": {
-            "temperature": 0,
-            "topP": 0.1,
-            "topK": 1
-        }
-    }
-
-    try:
-
-        response = requests.post(
-            GEMINI_URL,
-            params={"key": api_key},
-            json=payload,
-            timeout=300
-        )
-        
-        # This triggers the HTTPError that 'tenacity' looks for
-        response.raise_for_status()
-
-        data = response.json()
-
-        try:
-            raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-        except (KeyError, IndexError):
-            logger.error(f"Unexpected response format: {data}")
-            return []
-        
-        logger.info(f"LLM raw response received.\n {raw_text}...")  # log the first 200 chars
-
-
-        clean = raw_text.strip().removeprefix("```json").removesuffix("```").strip()
-        return json.loads(clean)
-
-    except requests.exceptions.HTTPError as e:
-        # If it's a 429, tenacity will catch this and retry
-        # If it's a 400 (Bad Request), tenacity will stop and we log it here
-        if e.response.status_code != 429 and e.response.status_code < 500:
-            logger.error(f"Permanent API Error: {e.response.text}")
-        raise e 
-    except json.JSONDecodeError as e:
-        logger.error(f"LLM returned invalid JSON: {e}")
-        return []
-    except Exception as e:
-        if is_retryable_error(e):
-            raise  # let tenacity retry
-
-        logger.error(f"Unexpected error: {e}", exc_info=True)
-        return []
-
-
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 @retry(
@@ -178,3 +92,90 @@ def extract_json(text: str) -> str:
     if match:
         return match.group(1)
     return text.strip()
+
+
+
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+GEMINI_URL_PRO = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+
+# Define which exceptions should trigger a retry
+def is_retryable_error(exception):
+    if isinstance(exception, requests.exceptions.HTTPError):
+        if exception.response is not None:
+            return exception.response.status_code == 429 or exception.response.status_code >= 500
+        return False
+
+    if isinstance(exception, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return True
+
+    return False
+
+@retry(
+    # Stop after 5 attempts
+    stop=stop_after_attempt(5),
+    # Wait exponentially: 5s, 10s, 20s, 40s, 80s (capped at 120s)
+    wait=wait_exponential(multiplier=2, min=5, max=120),
+    # Only retry if it's a rate limit or server error
+    retry=retry_if_exception(is_retryable_error),
+    # Log before sleeping
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True
+)
+def call_llm(prompt: str, full_text: str, api_key: str) -> list[dict]:
+    """
+    Sends prompt + extracted PDF text to Gemini with exponential backoff retry.
+    """
+    full_prompt = f"{prompt}\n{full_text}"
+
+    # print(full_prompt)
+
+    payload = {
+        "contents": [{"parts": [{"text": full_prompt}]}],
+        "generationConfig": {
+            "temperature": 0,
+            "topP": 0.1,
+            "topK": 1
+        }
+    }
+
+    try:
+
+        response = requests.post(
+            GEMINI_URL,
+            params={"key": api_key},
+            json=payload,
+            timeout=300
+        )
+        
+        # This triggers the HTTPError that 'tenacity' looks for
+        response.raise_for_status()
+
+        data = response.json()
+
+        try:
+            raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError):
+            logger.error(f"Unexpected response format: {data}")
+            return []
+        
+        logger.info(f"LLM raw response received.\n {raw_text}...")  # log the first 200 chars
+
+
+        clean = raw_text.strip().removeprefix("```json").removesuffix("```").strip()
+        return json.loads(clean)
+
+    except requests.exceptions.HTTPError as e:
+        # If it's a 429, tenacity will catch this and retry
+        # If it's a 400 (Bad Request), tenacity will stop and we log it here
+        if e.response.status_code != 429 and e.response.status_code < 500:
+            logger.error(f"Permanent API Error: {e.response.text}")
+        raise e 
+    except json.JSONDecodeError as e:
+        logger.error(f"LLM returned invalid JSON: {e}")
+        return []
+    except Exception as e:
+        if is_retryable_error(e):
+            raise  # let tenacity retry
+
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        return []
