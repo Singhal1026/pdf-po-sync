@@ -1,0 +1,51 @@
+# ── Python ───────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual Environment ───────────────────────────
+venv/
+.venv/
+env/
+.env
+po_venv/
+.po_venv/
+
+# ── Secrets & Config ──────────────────────────────
+# Keep config.ini structure but not actual secrets
+# Commit a config.example.ini instead
+config.ini
+
+# ── Data & PDFs ───────────────────────────────────
+data/input/
+data/*.xlsx
+data/*.xls
+
+# ── Outputs ───────────────────────────────────────
+output/
+
+# ── Logs ──────────────────────────────────────────
+logs/
+
+# ── OS Files ──────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDEs ──────────────────────────────────────────
+.vscode/
+.idea/
+*.iml
+
+# ── PyInstaller (if you freeze to .exe) ───────────
+*.spec
+*.exe
+
+# Test folder
+test/
