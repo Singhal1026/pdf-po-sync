@@ -1,181 +1,270 @@
 import re
 import json
-import time
 import logging
 import requests
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception, before_sleep_log, retry_if_exception_type
+from typing import Optional
+from pydantic import BaseModel, Field, ConfigDict, ValidationError
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception,
+    retry_if_exception_type,
+    before_sleep_log,
+)
 
 logger = logging.getLogger(__name__)
 
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+# ── Constants ────────────────────────────────────────────────────────────────
+
+GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "openai/gpt-oss-120b"
+
+GEMINI_MODEL    = "gemini-3-flash-preview"   # updated: Gemini 3 Flash released March 2026
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+
+# ── Pydantic schema ───────────────────────────────────────────────────────────
+
+class POItem(BaseModel):
+    """Single line-item row extracted from a PO."""
+
+    # populate_by_name lets us construct with either alias ("Article Code")
+    # or the Python field name (article_code)
+    model_config = ConfigDict(populate_by_name=True)
+
+    article_code: Optional[str]   = Field(None, alias="Article Code")
+    qty:          Optional[float] = Field(None, alias="Qty")
+    price:        Optional[float] = Field(None, alias="Price")
+
+
+class POResponse(BaseModel):
+    """Top-level wrapper returned by the LLM."""
+    items: list[POItem] = []
+
+
+# ── Groq JSON schema (API-level enforcement) ──────────────────────────────────
+#
+# Passed as response_format so the model is *constrained* to emit this shape.
+# Note: only works when the model supports structured outputs (json_schema).
+# If your Groq-routed model does not, fall back to {"type": "json_object"}
+# and rely on Pydantic alone.
+
+PO_JSON_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "po_extraction",
+        "strict": False,   # Groq recommends False for gpt-oss; Pydantic handles enforcement
+        "schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "Article Code": {"type": ["string", "null"]},
+                            "Qty":          {"type": ["number", "null"]},
+                            "Price":        {"type": ["number", "null"]},
+                        },
+                        "required": ["Article Code", "Qty", "Price"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["items"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+# ── Shared helpers ───────────────────────────────────────────────────────────
+
+EMPTY_RESPONSE: dict = {"items": []}
+
+
+def _extract_json(text: str) -> str:
+    """Strip optional ```json ... ``` fences from LLM output."""
+    match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+    return match.group(1) if match else text.strip()
+
+
+def _parse_to_items(raw_text: str) -> dict:
+    """
+    Parse and validate raw LLM text into {"items": [...]}.
+
+    Flow:
+      1. Strip fences and JSON-parse the text (raises JSONDecodeError → tenacity retries)
+      2. Normalise shape:  list → wrap,  single dict → wrap,  correct dict → pass through
+      3. Validate with Pydantic POResponse (catches wrong types / missing keys)
+      4. Serialise back with aliases so downstream code sees "Article Code" etc.
+    """
+    # Step 1 — guard against empty / whitespace-only response
+    if not raw_text or not raw_text.strip():
+        logger.warning("LLM returned an empty response; skipping parse.")
+        return EMPTY_RESPONSE
+
+    # Step 2 — parse
+    try:
+        clean  = _extract_json(raw_text)
+        parsed = json.loads(clean)
+    except json.JSONDecodeError as e:
+        logger.warning(f"JSON parse failed: {e}")
+        raise   # let tenacity retry
+
+    # Step 3 — normalise shape
+    if isinstance(parsed, list):
+        raw_dict = {"items": parsed}
+    elif isinstance(parsed, dict):
+        if "items" in parsed and isinstance(parsed["items"], list):
+            raw_dict = parsed
+        else:
+            logger.warning("LLM returned a single dict instead of a list; wrapping as one item.")
+            raw_dict = {"items": [parsed]}
+    else:
+        logger.warning(f"Unexpected LLM response type: {type(parsed)}")
+        return EMPTY_RESPONSE
+
+    # Step 4 — validate with Pydantic
+    try:
+        validated = POResponse.model_validate(raw_dict)
+    except ValidationError as e:
+        logger.warning(f"Pydantic validation failed:\n{e}")
+        return EMPTY_RESPONSE
+
+    # Step 5 — serialise back to plain dict using field aliases
+    #   by_alias=True  → keys are "Article Code", "Qty", "Price"
+    #   exclude_none=False → keep nulls so downstream dropna() works correctly
+    return validated.model_dump(by_alias=True)
+
+
+# ── Groq ─────────────────────────────────────────────────────────────────────
+
+def _is_groq_retryable(exc: Exception) -> bool:
+    """Retry on network errors, rate limits, server errors, and bad JSON."""
+    if isinstance(exc, json.JSONDecodeError):
+        return True
+    if isinstance(exc, requests.exceptions.RequestException):
+        if isinstance(exc, requests.exceptions.HTTPError):
+            code = exc.response.status_code if exc.response is not None else 0
+            return code == 429 or code >= 500
+        return True     # Timeout, ConnectionError, etc.
+    return False
+
 
 @retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=1, min=2, max=60),
-    retry=retry_if_exception_type((requests.exceptions.RequestException, json.JSONDecodeError)),
+    stop=stop_after_attempt(7),
+    wait=wait_exponential(multiplier=5, min=10, max=300),
+    retry=retry_if_exception(_is_groq_retryable),
     before_sleep=before_sleep_log(logger, logging.WARNING),
-    reraise=True
+    reraise=False,      # ← exhausted retries return EMPTY_RESPONSE below instead of raising
 )
-def call_groq(prompt: str, full_text: str, api_key: str) -> dict:
+def _groq_request(prompt: str, full_text: str, api_key: str) -> dict:
     """
-    Sends prompt + extracted PDF text to Groq API with retries.
-    Interface matches call_llm so you can swap easily.
+    Inner function decorated with tenacity.
+    Raises on retryable errors so tenacity can back off and retry.
+    Returns {"items": [...]} on success.
     """
     full_prompt = f"{prompt}\n\n{full_text}"
 
     payload = {
-        "model": "openai/gpt-oss-120b", # Or your preferred model
-        "messages": [
-            {"role": "user", "content": full_prompt}
-        ],
-        "response_format": {"type": "json_object"},
-        "max_tokens": 2048, # Groq uses 'max_tokens', not 'max_output_tokens'
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": full_prompt}],
+        "response_format": PO_JSON_SCHEMA,
+        "reasoning_format": "hidden",  # suppress thinking tokens from gpt-oss-120b; they would corrupt JSON output
+        "max_tokens": 2048,
         "temperature": 0,
-        "top_p": 0.1
+        "top_p": 0.1,
     }
-
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
+    response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=60)
+    response.raise_for_status()
+
+    data = response.json()
+
     try:
- 
-        response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=60)
-        response.raise_for_status()
+        raw_text = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError):
+        # Malformed structure — log it and raise so tenacity retries
+        logger.error("Invalid Groq response structure: %s", data)
+        raise ValueError("Invalid Groq response structure")
 
-        data = response.json()
+    logger.info(f"Groq raw response received (first 200 chars):\n{raw_text[:200]}")
+    return _parse_to_items(raw_text)
 
-        raw_text = ""
 
-        try:
-            raw_text = data["choices"][0]["message"]["content"]
-            logger.info(f"Groq raw response received.\n {raw_text}...")  # log the first 200 chars
-        except (KeyError, IndexError):
-            logger.error("Retrying due to invalid response structure: %s", data)
-            raise ValueError("Invalid Groq response structure")
-
-        try:
-            clean = extract_json(raw_text)
-            parsed = json.loads(clean)
-            if isinstance(parsed, list):
-                return {"items": parsed}
-            
-            if isinstance(parsed, dict):
-                if "items" in parsed and isinstance(parsed["items"], list):
-                    return parsed
-                else:
-                    # Try wrapping dict as single row
-                    return {"items": [parsed]}
-                
-            # Fallback
-            logger.warning("Unexpected response format from Groq")
-            return {"items": []}
-        
-        except json.JSONDecodeError as e:
-            logger.warning(f"Retrying due to JSON decode error: {e}")
-            raise e
-
-    except json.JSONDecodeError as e:
-        logger.error(f"Groq returned invalid JSON: {e}")
-        return []
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"Groq request exception: {e}")
-        raise e
+def call_groq(prompt: str, full_text: str, api_key: str) -> dict:
+    """
+    Public interface: always returns {"items": [...]}, never raises.
+    Uses _groq_request (with tenacity retries) internally.
+    Falls back to EMPTY_RESPONSE if all retries are exhausted.
+    """
+    try:
+        result = _groq_request(prompt, full_text, api_key)
+        # _groq_request returns None when reraise=False and retries are exhausted
+        return result if result is not None else EMPTY_RESPONSE
     except Exception as e:
-        logger.error(f"Unexpected error in Groq call: {e}", exc_info=True)
-        return []
+        logger.error(f"Groq call failed after all retries: {e}", exc_info=True)
+        return EMPTY_RESPONSE
 
 
-def extract_json(text: str) -> str:
-    match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
-    if match:
-        return match.group(1)
-    return text.strip()
+# ── Gemini ───────────────────────────────────────────────────────────────────
 
+def _is_gemini_retryable(exc: Exception) -> bool:
+    if isinstance(exc, requests.exceptions.HTTPError):
+        code = exc.response.status_code if exc.response is not None else 0
+        return code == 429 or code >= 500
+    return isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError))
 
-
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-GEMINI_URL_PRO = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
-
-# Define which exceptions should trigger a retry
-def is_retryable_error(exception):
-    if isinstance(exception, requests.exceptions.HTTPError):
-        if exception.response is not None:
-            return exception.response.status_code == 429 or exception.response.status_code >= 500
-        return False
-
-    if isinstance(exception, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
-        return True
-
-    return False
 
 @retry(
-    # Stop after 5 attempts
-    stop=stop_after_attempt(5),
-    # Wait exponentially: 5s, 10s, 20s, 40s, 80s (capped at 120s)
-    wait=wait_exponential(multiplier=2, min=5, max=120),
-    # Only retry if it's a rate limit or server error
-    retry=retry_if_exception(is_retryable_error),
-    # Log before sleeping
+    stop=stop_after_attempt(7),
+    wait=wait_exponential(multiplier=5, min=10, max=300),
+    retry=retry_if_exception(_is_gemini_retryable),
     before_sleep=before_sleep_log(logger, logging.WARNING),
-    reraise=True
+    reraise=False,      # ← same pattern as Groq
 )
-def call_llm(prompt: str, full_text: str, api_key: str) -> list[dict]:
+def _gemini_request(prompt: str, full_text: str, api_key: str) -> dict:
     """
-    Sends prompt + extracted PDF text to Gemini with exponential backoff retry.
+    Inner function decorated with tenacity.
+    Returns {"items": [...]} on success, raises on retryable errors.
     """
     full_prompt = f"{prompt}\n{full_text}"
 
-    # print(full_prompt)
-
     payload = {
         "contents": [{"parts": [{"text": full_prompt}]}],
-        "generationConfig": {
-            "temperature": 0,
-            "topP": 0.1,
-            "topK": 1
-        }
+        "generationConfig": {"temperature": 0, "topP": 0.1, "topK": 1},
     }
 
+    url = f"{GEMINI_BASE_URL}/{GEMINI_MODEL}:generateContent"
+    response = requests.post(
+        url, params={"key": api_key}, json=payload, timeout=300
+    )
+    response.raise_for_status()
+
+    data = response.json()
+
     try:
+        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        logger.error(f"Unexpected Gemini response format: {data}")
+        raise ValueError("Invalid Gemini response structure")
 
-        response = requests.post(
-            GEMINI_URL,
-            params={"key": api_key},
-            json=payload,
-            timeout=300
-        )
-        
-        # This triggers the HTTPError that 'tenacity' looks for
-        response.raise_for_status()
-
-        data = response.json()
-
-        try:
-            raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-        except (KeyError, IndexError):
-            logger.error(f"Unexpected response format: {data}")
-            return []
-        
-        logger.info(f"LLM raw response received.\n {raw_text}...")  # log the first 200 chars
+    logger.info(f"Gemini raw response received (first 200 chars):\n{raw_text[:200]}")
+    return _parse_to_items(raw_text)
 
 
-        clean = raw_text.strip().removeprefix("```json").removesuffix("```").strip()
-        return json.loads(clean)
-
-    except requests.exceptions.HTTPError as e:
-        # If it's a 429, tenacity will catch this and retry
-        # If it's a 400 (Bad Request), tenacity will stop and we log it here
-        if e.response.status_code != 429 and e.response.status_code < 500:
-            logger.error(f"Permanent API Error: {e.response.text}")
-        raise e 
-    except json.JSONDecodeError as e:
-        logger.error(f"LLM returned invalid JSON: {e}")
-        return []
+def call_llm(prompt: str, full_text: str, api_key: str) -> dict:
+    """
+    Public interface for Gemini: always returns {"items": [...]}, never raises.
+    Mirrors call_groq so the two are interchangeable in BaseHandler._call_llm().
+    """
+    try:
+        result = _gemini_request(prompt, full_text, api_key)
+        return result if result is not None else EMPTY_RESPONSE
     except Exception as e:
-        if is_retryable_error(e):
-            raise  # let tenacity retry
-
-        logger.error(f"Unexpected error: {e}", exc_info=True)
-        return []
+        logger.error(f"Gemini call failed after all retries: {e}", exc_info=True)
+        return EMPTY_RESPONSE
